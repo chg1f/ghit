@@ -33,6 +33,7 @@ type Hitter struct {
 	key   string
 
 	expire      cron.Schedule
+	expireAt    time.Timer
 	timer       *time.Timer
 	maxInterval time.Duration
 	minInterval time.Duration
@@ -42,6 +43,7 @@ type Hitter struct {
 	syncedAt    time.Time
 	remote      int64
 	local       int64
+	wait        int32
 }
 
 func NewHitter(conf *Config) (*Hitter, error) {
@@ -71,12 +73,12 @@ func NewHitter(conf *Config) (*Hitter, error) {
 		syncedAt:    time.Time{},
 		remote:      0,
 		local:       0,
+		wait:        0,
 	}
 	return &h, nil
 }
-func (h *Hitter) sync() (time.Time, error) {
+func (h *Hitter) sync(now time.Time) (time.Time, error) {
 	var (
-		now   = time.Now()
 		local = atomic.LoadInt64(&h.local)
 	)
 	current, err := h.cache.IncrBy(context.Background(), h.key, local).Result()
@@ -84,8 +86,12 @@ func (h *Hitter) sync() (time.Time, error) {
 		return now, err
 	}
 	h.syncedAt = now
+
+	atomic.StoreInt32(&h.wait, 1)
 	atomic.StoreInt64(&h.remote, current)
 	atomic.AddInt64(&h.local, -1*local)
+	atomic.StoreInt32(&h.wait, 0)
+
 	h.cache.ExpireAt(context.Background(), h.key, h.expire.Next(now))
 	if current >= h.limit {
 		return h.expire.Next(now), nil
@@ -99,8 +105,8 @@ func (h *Hitter) sync() (time.Time, error) {
 	}
 	return now.Add(interval), nil
 }
-func (h *Hitter) Sync() error {
-	next, err := h.sync()
+func (h *Hitter) Sync(now time.Time) error {
+	next, err := h.sync(time.Now())
 	if err != nil {
 		h.timer.Reset(h.minInterval)
 		return err
@@ -115,11 +121,13 @@ func (h *Hitter) Hit() (err error) {
 		}
 	}()
 	select {
-	case <-h.timer.C:
-		if err := h.Sync(); err != nil {
+	case now := <-h.timer.C:
+		if err := h.Sync(now); err != nil {
 			return err
 		}
 	default:
+	}
+	for atomic.LoadInt32(&h.wait) != 0 {
 	}
 	if EnableLimit && h.enableLimit && h.remote+h.local >= h.limit {
 		return ErrOverhit
