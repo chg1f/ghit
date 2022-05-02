@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	DefaultMinInterval = time.Second
-	DefaultMaxInterval = time.Minute
+	DefaultMinInterval time.Duration
+	DefaultMaxInterval = time.Second
 
 	EnableLimit = true
 
@@ -52,7 +52,7 @@ func NewHitter(conf *Config) (*Hitter, error) {
 		maxInterval = conf.MaxInterval
 	}
 	minInterval := DefaultMinInterval
-	if conf.MaxInterval != 0 {
+	if conf.MinInterval != 0 {
 		minInterval = conf.MinInterval
 	}
 	h := Hitter{
