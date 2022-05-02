@@ -3,7 +3,7 @@ GHit
 
 ## Intro
 
-High-precision, lazy-loaded, smart, distributed counter and limiter
+High-precision, lazy-loading, lock-free, smart, distributed counter and limiter
 
 
 ## Example
