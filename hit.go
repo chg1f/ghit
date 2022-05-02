@@ -23,6 +23,7 @@ type Config struct {
 	Redis       redis.Cmdable
 	Key         string
 	ExpireSpec  string
+	EnableLimit bool
 	Limit       int64
 	MaxInterval time.Duration
 	MinInterval time.Duration
@@ -36,10 +37,11 @@ type Hitter struct {
 	maxInterval time.Duration
 	minInterval time.Duration
 
-	limit    int64
-	syncedAt time.Time
-	remote   int64
-	local    int64
+	enableLimit bool
+	limit       int64
+	syncedAt    time.Time
+	remote      int64
+	local       int64
 }
 
 func NewHitter(conf *Config) (*Hitter, error) {
@@ -64,10 +66,11 @@ func NewHitter(conf *Config) (*Hitter, error) {
 		maxInterval: maxInterval,
 		minInterval: minInterval,
 
-		limit:    conf.Limit,
-		syncedAt: time.Time{},
-		remote:   0,
-		local:    0,
+		enableLimit: conf.EnableLimit,
+		limit:       conf.Limit,
+		syncedAt:    time.Time{},
+		remote:      0,
+		local:       0,
 	}
 	return &h, nil
 }
@@ -118,7 +121,7 @@ func (h *Hitter) Hit() (err error) {
 		}
 	default:
 	}
-	if EnableLimit && h.remote+h.local >= h.limit {
+	if EnableLimit && h.enableLimit && h.remote+h.local >= h.limit {
 		return ErrOverhit
 	}
 	return nil
