@@ -3,12 +3,12 @@ package ghit
 import "github.com/go-redis/redis/v8"
 
 func ExampleHitter() {
-	EnableLimit = true
 	hitter, err := NewHitter(&Config{
-		Redis:      redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
-		Key:        "hitted",
-		ExpireSpec: "@midnight",
-		Limit:      1000,
+		Redis:       redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
+		Key:         "hitted",
+		ExpireSpec:  "@midnight",
+		EnableLimit: true,
+		Limit:       1000,
 	})
 	if err != nil {
 		panic(err)

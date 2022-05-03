@@ -3,47 +3,54 @@ package ghit
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync/atomic"
 	"time"
 
+	"github.com/VividCortex/ewma"
 	"github.com/go-redis/redis/v8"
 	"github.com/robfig/cron"
 )
 
 var (
+	Enable = true
+
 	DefaultMinInterval time.Duration
 	DefaultMaxInterval = time.Second
-
-	EnableLimit = true
 
 	ErrOverhit = errors.New("overhit")
 )
 
 type Config struct {
-	Redis       redis.Cmdable
-	Key         string
-	ExpireSpec  string
+	Redis redis.Cmdable
+	Key   string
+
+	ExpireSpec     string
+	FollowInterval time.Duration
+	MaxInterval    time.Duration
+	MinInterval    time.Duration
+
 	EnableLimit bool
 	Limit       int64
-	MaxInterval time.Duration
-	MinInterval time.Duration
 }
 type Hitter struct {
 	cache redis.Cmdable
 	key   string
 
-	expire      cron.Schedule
-	expireAt    time.Timer
-	timer       *time.Timer
-	maxInterval time.Duration
-	minInterval time.Duration
+	expire         cron.Schedule
+	timer          *time.Timer
+	followInterval time.Duration
+	maxInterval    time.Duration
+	minInterval    time.Duration
+
+	ewma         ewma.MovingAverage
+	latestSyncAt time.Time
+	local        int64
 
 	enableLimit bool
 	limit       int64
-	syncedAt    time.Time
-	remote      int64
-	local       int64
-	wait        int32
+
+	current int64
 }
 
 func NewHitter(conf *Config) (*Hitter, error) {
@@ -59,78 +66,102 @@ func NewHitter(conf *Config) (*Hitter, error) {
 	if conf.MinInterval != 0 {
 		minInterval = conf.MinInterval
 	}
+	followInterval := DefaultMaxInterval * 3
+	if conf.FollowInterval != 0 {
+		followInterval = conf.FollowInterval
+	}
 	h := Hitter{
 		cache: conf.Redis,
 		key:   conf.Key,
 
-		expire:      schedule,
-		timer:       time.NewTimer(minInterval),
-		maxInterval: maxInterval,
-		minInterval: minInterval,
+		expire:         schedule,
+		timer:          time.NewTimer(minInterval),
+		followInterval: followInterval,
+		maxInterval:    maxInterval,
+		minInterval:    minInterval,
+
+		ewma:         ewma.NewMovingAverage(),
+		latestSyncAt: time.Now(),
 
 		enableLimit: conf.EnableLimit,
 		limit:       conf.Limit,
-		syncedAt:    time.Time{},
-		remote:      0,
-		local:       0,
-		wait:        0,
 	}
+	go h.flush()
 	return &h, nil
 }
-func (h *Hitter) sync(now time.Time) (time.Time, error) {
+
+func (h *Hitter) flush() {
+	if h.cache == nil {
+		h.timer.Stop()
+		return
+	}
+	for {
+		select {
+		case now, ok := <-h.timer.C:
+			if !ok {
+				return
+			}
+			h.Sync(now)
+		}
+	}
+}
+func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
+	if h.cache == nil {
+		return time.Time{}, nil
+	}
 	var (
-		local = atomic.LoadInt64(&h.local)
+		local    = atomic.LoadInt64(&h.local)
+		expireAt = h.expire.Next(now)
+		key      = h.key + ":" + strconv.FormatInt(expireAt.Unix(), 10)
 	)
-	current, err := h.cache.IncrBy(context.Background(), h.key, local).Result()
-	if err != nil {
-		return now, err
-	}
-	h.syncedAt = now
-
-	atomic.StoreInt32(&h.wait, 1)
-	atomic.StoreInt64(&h.remote, current)
-	atomic.AddInt64(&h.local, -1*local)
-	atomic.StoreInt32(&h.wait, 0)
-
-	h.cache.ExpireAt(context.Background(), h.key, h.expire.Next(now))
-	if current >= h.limit {
-		return h.expire.Next(now), nil
-	}
-	qps := local / int64(h.syncedAt.Sub(now).Seconds())
-	interval := time.Duration((h.limit-current)/qps) * time.Second / 2 // XXX: after half of local qps sync remote hitted
-	if interval > h.maxInterval {
-		return now.Add(h.maxInterval), nil
-	} else if interval < h.minInterval {
-		return now.Add(h.minInterval), nil
-	}
-	return now.Add(interval), nil
-}
-func (h *Hitter) Sync(now time.Time) error {
-	next, err := h.sync(time.Now())
-	if err != nil {
-		h.timer.Reset(h.minInterval)
-		return err
-	}
-	h.timer.Reset(next.Sub(time.Now()))
-	return nil
-}
-func (h *Hitter) Hit() (err error) {
 	defer func() {
-		if err != nil {
-			atomic.AddInt64(&h.local, 1)
+		if next.Sub(expireAt) > 0 {
+			next = expireAt
 		}
+		interval := time.Now().Sub(next)
+		if interval > h.maxInterval {
+			interval = h.maxInterval
+		} else if interval < h.minInterval {
+			interval = h.minInterval
+		}
+		h.timer.Reset(interval)
 	}()
-	select {
-	case now := <-h.timer.C:
-		if err := h.Sync(now); err != nil {
-			return err
+	if local != 0 {
+		current, err := h.cache.IncrBy(context.Background(), key, local).Result()
+		if err != nil {
+			atomic.AddInt64(&h.local, local)
+			return now, err
 		}
-	default:
+		h.cache.Expire(context.Background(), key, time.Now().Sub(expireAt)+h.followInterval)
+
+		atomic.StoreInt64(&h.current, current)
+		atomic.AddInt64(&h.local, -local)
 	}
-	for atomic.LoadInt32(&h.wait) != 0 {
+	if atomic.LoadInt64(&h.current) >= h.limit {
+		return expireAt, nil
 	}
-	if EnableLimit && h.enableLimit && h.remote+h.local >= h.limit {
+
+	h.latestSyncAt = now
+	h.ewma.Add(float64(local) / h.latestSyncAt.Sub(now).Seconds())
+	estimate := time.Duration(float64(h.limit-atomic.LoadInt64(&h.current)) / h.ewma.Value() * float64(time.Second))
+	return now.Add(estimate / 2), nil
+}
+
+func (h *Hitter) Hit() (err error) {
+	if !Enable {
+		return nil
+	}
+	if h.enableLimit && atomic.LoadInt64(&h.current) >= h.limit {
+		h.Sync(time.Now())
 		return ErrOverhit
 	}
+	atomic.AddInt64(&h.current, 1)
+	atomic.AddInt64(&h.local, 1)
+	return nil
+}
+
+func (h *Hitter) Close() error {
+	h.Sync(time.Now())
+	h.timer.Stop()
 	return nil
 }

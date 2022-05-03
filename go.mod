@@ -3,6 +3,7 @@ module github.com/chg1f/ghit
 go 1.18
 
 require (
+	github.com/VividCortex/ewma v1.2.0
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/robfig/cron v1.2.0
 )

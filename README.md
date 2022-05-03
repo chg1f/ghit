@@ -24,10 +24,11 @@ func init() {
 		err error
 	)
 	hitter, err = ghit.NewHitter(&ghit.Config{
-		Redis:      redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
-		Key:        "hitted:run",
-		ExpireSpec: "@midnight",
-		Limit:      1000,
+		Redis:       redis.NewClient(&redis.Options{Addr: "localhost:6379"}),
+		Key:         "hitted",
+		ExpireSpec:  "@midnight",
+		EnableLimit: true,
+		Limit:       1000,
 	})
 	if err != nil {
 		panic(err)
