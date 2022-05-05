@@ -174,7 +174,7 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 		estimate := time.Duration(float64(h.limit-total) / qps * float64(time.Second))
 		return now.Add(estimate / 2), nil
 	}
-	return h.maxInterval, nil
+	return now.Add(h.maxInterval), nil
 }
 
 func (h *Hitter) Hit() (err error) {
