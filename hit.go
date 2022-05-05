@@ -12,6 +12,7 @@ import (
 	"github.com/VividCortex/ewma"
 	"github.com/go-redis/redis/v8"
 	"github.com/robfig/cron"
+	"go.uber.org/zap"
 )
 
 var (
@@ -23,7 +24,7 @@ var (
 	DefaultNodeExpireInterval = time.Hour
 	DefaultFollowInterval     = time.Hour
 	DefaultMinInterval        time.Duration
-	DefaultMaxInterval        = time.Second
+	DefaultMaxInterval        time.Duration
 
 	ErrOverhit        = errors.New("overhit")
 	ErrNondistrubuted = errors.New("nondistrubuted")
@@ -127,27 +128,35 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 			next = expireAt
 		}
 		interval := time.Now().Sub(next)
-		if interval > h.maxInterval {
+		if h.maxInterval != 0 && interval > h.maxInterval {
 			interval = h.maxInterval
 		} else if interval < h.minInterval {
 			interval = h.minInterval
 		}
+		zap.L().Info(
+			"reset timer",
+			zap.Time("next", time.Now().Add(interval)),
+		)
 		h.timer.Reset(interval)
 	}()
 	if local != 0 {
 		key := h.key + ":" + strconv.FormatInt(expireAt.Unix(), 10)
-		current, err := h.cache.IncrBy(context.Background(), key, local).Result()
+		total, err := h.cache.IncrBy(context.Background(), key, local).Result()
 		if err != nil {
 			return now, err
 		}
 		h.cache.Expire(context.Background(), key, time.Now().Sub(expireAt)+h.followInterval)
 
 		atomic.StoreInt32(&h.spinForUpdate, 1)
-		atomic.StoreInt64(&h.remote, current)
+		atomic.StoreInt64(&h.remote, total)
 		atomic.AddInt64(&h.local, -local)
 		h.latestSyncAt = now
 		atomic.StoreInt32(&h.spinForUpdate, 0)
-		if current >= h.limit {
+		zap.L().Info(
+			"fetched total hitted",
+			zap.Int64("total", total),
+		)
+		if total >= h.limit {
 			return expireAt, nil
 		}
 	}
@@ -160,8 +169,8 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 		}
 		qps = h.QPS()
 	}
-	current := atomic.LoadInt64(&h.remote) + atomic.LoadInt64(&h.local)
-	estimate := time.Duration(float64(h.limit-current) / qps * float64(time.Second))
+	total := atomic.LoadInt64(&h.remote) + atomic.LoadInt64(&h.local)
+	estimate := time.Duration(float64(h.limit-total) / qps * float64(time.Second))
 	return now.Add(estimate / 2), nil
 }
 
@@ -173,7 +182,11 @@ func (h *Hitter) Hit() (err error) {
 	select {
 	case <-h.timer.C:
 		atomic.StoreInt32(&h.spinForExpire, 1)
-		if now.Sub(h.expire.Next(h.latestHitAt)) > 0 {
+		if expireAt := h.expire.Next(h.latestHitAt); now.Sub(expireAt) > 0 {
+			zap.L().Info(
+				"after expire",
+				zap.Time("expire", expireAt),
+			)
 			h.Sync(h.latestHitAt)
 		}
 		atomic.StoreInt32(&h.spinForExpire, 0)
@@ -218,19 +231,33 @@ func (h *Hitter) QPS() float64 {
 			Max: strconv.FormatInt(now.Unix(), 10),
 		}).Result()
 		if err == nil {
-			cluster := qps / float64(len(nodeIDs))
+			zap.L().Info(
+				"alive nodes",
+				zap.Strings("nodes", nodeIDs),
+			)
+			fetched := qps / float64(len(nodeIDs))
 			for _, nodeID := range nodeIDs {
 				if nodeID == NodeID {
 					continue
 				}
 				v, err := h.cache.Get(context.Background(), h.key+":"+nodeID+NodesQPSCacheKeySuffix).Float64()
 				if err != nil {
-					cluster += qps / float64(len(nodeIDs))
+					fetched += qps / float64(len(nodeIDs))
 					continue
 				}
-				cluster += v / float64(len(nodeIDs))
+				fetched += v / float64(len(nodeIDs))
+				zap.L().Info(
+					"fetched node qps",
+					zap.String("node", nodeID),
+					zap.Float64("qps", v),
+				)
 			}
-			qps = cluster
+			h.ewma.Set(fetched)
+			zap.L().Info("fetched clusters",
+				zap.Float64("qps", fetched),
+				zap.Float64("delta", fetched-qps),
+			)
+			return fetched
 		}
 	}
 	return qps
