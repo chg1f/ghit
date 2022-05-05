@@ -135,6 +135,7 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 		}
 		zap.L().Info(
 			"reset timer",
+			zap.String("key", h.key),
 			zap.Time("next", time.Now().Add(interval)),
 		)
 		h.timer.Reset(interval)
@@ -154,6 +155,7 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 		atomic.StoreInt32(&h.spinForUpdate, 0)
 		zap.L().Info(
 			"fetched total hitted",
+			zap.String("key", h.key),
 			zap.Int64("total", total),
 		)
 		if h.enableLimit && total >= h.limit {
@@ -188,6 +190,7 @@ func (h *Hitter) Hit() (err error) {
 		if expireAt := h.expire.Next(h.latestHitAt); now.Sub(expireAt) > 0 {
 			zap.L().Info(
 				"after expire",
+				zap.String("key", h.key),
 				zap.Time("expire", expireAt),
 			)
 			h.Sync(h.latestHitAt)
@@ -236,6 +239,7 @@ func (h *Hitter) QPS() float64 {
 		if err == nil {
 			zap.L().Info(
 				"alive nodes",
+				zap.String("key", h.key),
 				zap.Strings("nodes", nodeIDs),
 			)
 			fetched := qps / float64(len(nodeIDs))
@@ -251,12 +255,14 @@ func (h *Hitter) QPS() float64 {
 				fetched += v / float64(len(nodeIDs))
 				zap.L().Info(
 					"fetched node qps",
+					zap.String("key", h.key),
 					zap.String("node", nodeID),
 					zap.Float64("qps", v),
 				)
 			}
 			h.ewma.Set(fetched)
 			zap.L().Info("fetched clusters",
+				zap.String("key", h.key),
 				zap.Float64("qps", fetched),
 				zap.Float64("delta", fetched-qps),
 			)
