@@ -156,7 +156,7 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 			"fetched total hitted",
 			zap.Int64("total", total),
 		)
-		if total >= h.limit {
+		if h.enableLimit && total >= h.limit {
 			return expireAt, nil
 		}
 	}
@@ -169,9 +169,12 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 		}
 		qps = h.QPS()
 	}
-	total := atomic.LoadInt64(&h.remote) + atomic.LoadInt64(&h.local)
-	estimate := time.Duration(float64(h.limit-total) / qps * float64(time.Second))
-	return now.Add(estimate / 2), nil
+	if h.enableLimit {
+		total := atomic.LoadInt64(&h.remote) + atomic.LoadInt64(&h.local)
+		estimate := time.Duration(float64(h.limit-total) / qps * float64(time.Second))
+		return now.Add(estimate / 2), nil
+	}
+	return h.maxInterval, nil
 }
 
 func (h *Hitter) Hit() (err error) {
