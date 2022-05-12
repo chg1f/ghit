@@ -10,7 +10,7 @@ import (
 )
 
 var (
-	Enable = true
+	EnableLimit = true
 
 	DefaultShakeRate = 0.5
 
@@ -179,7 +179,7 @@ func (h *Hitter) Hit() (ok bool, err error) {
 		h.Sync(time.Now())
 	default:
 	}
-	if h.enableLimit {
+	if EnableLimit && h.enableLimit {
 		if atomic.LoadInt64(&h.unsync) >= h.limit {
 			return false, nil
 		}
