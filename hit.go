@@ -21,13 +21,13 @@ var (
 type HitterOption struct {
 	NodeOption
 
-	ExpireSpec     string
-	ShakeRate      float64
-	EnableMaxSync  bool
-	MaxInterval    time.Duration
-	EnableMinSync  bool
-	MinInterval    time.Duration
-	FollowInterval time.Duration
+	ExpireSpec      string
+	ShakeRate       float64
+	EnableMaxSync   bool
+	MaxSyncInterval time.Duration
+	EnableMinSync   bool
+	MinSyncInterval time.Duration
+	FollowInterval  time.Duration
 
 	Key             string
 	KeyQPSSuffix    string
@@ -39,13 +39,13 @@ type HitterOption struct {
 type Hitter struct {
 	*Node
 
-	sched          cron.Schedule
-	stableRate     float64
-	enableMaxSync  bool
-	maxInterval    time.Duration
-	enableMinSync  bool
-	minInterval    time.Duration
-	followInterval time.Duration
+	sched           cron.Schedule
+	stableRate      float64
+	enableMaxSync   bool
+	maxSyncInterval time.Duration
+	enableMinSync   bool
+	minSyncInterval time.Duration
+	followInterval  time.Duration
 
 	key             string
 	keyQPSSuffix    string
@@ -90,13 +90,13 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 	h := Hitter{
 		Node: NewNode(&opt.NodeOption),
 
-		sched:          sched,
-		stableRate:     stableRate,
-		enableMaxSync:  opt.EnableMaxSync,
-		maxInterval:    opt.MaxInterval,
-		enableMinSync:  opt.EnableMinSync,
-		minInterval:    opt.MinInterval,
-		followInterval: opt.FollowInterval,
+		sched:           sched,
+		stableRate:      stableRate,
+		enableMaxSync:   opt.EnableMaxSync,
+		maxSyncInterval: opt.MaxSyncInterval,
+		enableMinSync:   opt.EnableMinSync,
+		minSyncInterval: opt.MinSyncInterval,
+		followInterval:  opt.FollowInterval,
 
 		key:             opt.Key,
 		keyQPSSuffix:    keyQPSSuffix,
@@ -123,11 +123,11 @@ func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
 	)
 	defer func() {
 		interval := time.Now().Sub(next)
-		if h.enableMaxSync && interval > h.maxInterval {
-			interval = h.maxInterval
+		if h.enableMaxSync && interval > h.maxSyncInterval {
+			interval = h.maxSyncInterval
 		}
-		if h.enableMinSync && interval < h.minInterval {
-			interval = h.minInterval
+		if h.enableMinSync && interval < h.minSyncInterval {
+			interval = h.minSyncInterval
 		}
 		if time.Now().Add(interval).After(expireAt) {
 			interval = expireAt.Sub(time.Now())
