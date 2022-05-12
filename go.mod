@@ -5,6 +5,7 @@ go 1.18
 require (
 	github.com/VividCortex/ewma v1.2.0
 	github.com/go-redis/redis/v8 v8.11.5
+	github.com/google/uuid v1.3.0
 	github.com/robfig/cron v1.2.0
 	go.uber.org/zap v1.21.0
 )

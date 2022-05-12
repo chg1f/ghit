@@ -2,272 +2,235 @@ package ghit
 
 import (
 	"context"
-	"errors"
-	"math"
-	"math/rand"
-	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/VividCortex/ewma"
-	"github.com/go-redis/redis/v8"
 	"github.com/robfig/cron"
-	"go.uber.org/zap"
 )
 
 var (
 	Enable = true
 
-	NodeID  string
-	MaxDate time.Time
+	DefaultShakeRate = 0.5
 
-	DefaultNodeExpireInterval = time.Hour
-	DefaultFollowInterval     = time.Hour
-	DefaultMinInterval        time.Duration
-	DefaultMaxInterval        time.Duration
-
-	ErrOverhit        = errors.New("overhit")
-	ErrNondistrubuted = errors.New("nondistrubuted")
-
-	NodesQPSCacheKeySuffix = ":QPS"
-	NodesCacheKeySuffix    = ":NODES"
+	DefaultKeyQPSSuffix    = ":QPS"
+	DefaultKeySuffixFormat = "2006-01-02"
 )
 
-func init() {
-	NodeID = strconv.FormatUint(rand.Uint64(), 16)
-	MaxDate = time.Now().AddDate(math.MaxInt, math.MaxInt, math.MaxInt)
-}
+type HitterOption struct {
+	NodeOption
 
-type Config struct {
-	Redis redis.Cmdable
-	Key   string
+	ExpireSpec     string
+	ShakeRate      float64
+	EnableMaxSync  bool
+	MaxInterval    time.Duration
+	EnableMinSync  bool
+	MinInterval    time.Duration
+	FollowInterval time.Duration
 
-	ExpireSpec         string
-	NodeExpireInterval time.Duration
-	FollowInterval     time.Duration
-	MaxInterval        time.Duration
-	MinInterval        time.Duration
+	Key             string
+	KeyQPSSuffix    string
+	KeySuffixFormat string
 
 	EnableLimit bool
 	Limit       int64
 }
 type Hitter struct {
-	cache redis.Cmdable
-	key   string
+	*Node
 
-	expire             cron.Schedule
-	timer              *time.Timer
-	nodeExpireInterval time.Duration
-	followInterval     time.Duration
-	maxInterval        time.Duration
-	minInterval        time.Duration
+	sched          cron.Schedule
+	stableRate     float64
+	enableMaxSync  bool
+	maxInterval    time.Duration
+	enableMinSync  bool
+	minInterval    time.Duration
+	followInterval time.Duration
 
-	ewma          ewma.MovingAverage
-	latestSyncAt  time.Time
-	latestHitAt   time.Time
-	remote        int64
-	local         int64
-	spinForExpire int32
-	spinForUpdate int32
+	key             string
+	keyQPSSuffix    string
+	keySuffixFormat string
+
+	timer *time.Timer
+
+	qps      ewma.MovingAverage
+	syncedAt time.Time
+	synced   int64
+	unsync   int64
+	hittedAt time.Time
 
 	enableLimit bool
 	limit       int64
 }
 
-func NewHitter(conf *Config) (*Hitter, error) {
-	schedule, err := cron.ParseStandard(conf.ExpireSpec)
+func NewHitter(opt *HitterOption) (*Hitter, error) {
+	now := time.Now()
+	sched, err := cron.ParseStandard(opt.ExpireSpec)
 	if err != nil {
 		return nil, err
 	}
-	maxInterval := DefaultMaxInterval
-	if conf.MaxInterval != 0 {
-		maxInterval = conf.MaxInterval
+	stableRate := 1 / DefaultShakeRate
+	if opt.ShakeRate < 0 {
+		if opt.ShakeRate >= 1 {
+			stableRate = 0
+		} else if opt.ShakeRate == 0 {
+			stableRate = 1
+		} else {
+			stableRate = 1 / opt.ShakeRate
+		}
 	}
-	minInterval := DefaultMinInterval
-	if conf.MinInterval != 0 {
-		minInterval = conf.MinInterval
+	keySuffixFormat := DefaultKeySuffixFormat
+	if opt.KeySuffixFormat != "" {
+		keySuffixFormat = opt.KeySuffixFormat
 	}
-	followInterval := DefaultFollowInterval
-	if conf.FollowInterval != 0 {
-		followInterval = conf.FollowInterval
-	}
-	nodeExpireInterval := DefaultNodeExpireInterval
-	if conf.NodeExpireInterval != 0 {
-		nodeExpireInterval = conf.NodeExpireInterval
+	keyQPSSuffix := opt.Key + DefaultKeyQPSSuffix
+	if opt.KeyQPSSuffix != "" {
+		keyQPSSuffix = opt.KeyQPSSuffix
 	}
 	h := Hitter{
-		cache: conf.Redis,
-		key:   conf.Key,
+		Node: NewNode(&opt.NodeOption),
 
-		expire:             schedule,
-		timer:              time.NewTimer(minInterval),
-		maxInterval:        maxInterval,
-		minInterval:        minInterval,
-		followInterval:     followInterval,
-		nodeExpireInterval: nodeExpireInterval,
+		sched:          sched,
+		stableRate:     stableRate,
+		enableMaxSync:  opt.EnableMaxSync,
+		maxInterval:    opt.MaxInterval,
+		enableMinSync:  opt.EnableMinSync,
+		minInterval:    opt.MinInterval,
+		followInterval: opt.FollowInterval,
 
-		ewma:         ewma.NewMovingAverage(),
-		latestSyncAt: time.Now(),
+		key:             opt.Key,
+		keyQPSSuffix:    keyQPSSuffix,
+		keySuffixFormat: keySuffixFormat,
 
-		enableLimit: conf.EnableLimit,
-		limit:       conf.Limit,
+		timer:    time.NewTimer(0),
+		syncedAt: now,
+		hittedAt: now,
+
+		qps: ewma.NewMovingAverage(),
 	}
 	return &h, nil
 }
 
-func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
-	if h.cache == nil {
-		return MaxDate, ErrNondistrubuted
+func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
+	if h.Node == nil {
+		return time.Time{}, nil
 	}
+
 	var (
-		local    = atomic.LoadInt64(&h.local)
-		expireAt = h.expire.Next(now)
+		unsync   = atomic.LoadInt64(&h.unsync)
+		local    = unsync - h.synced
+		expireAt = h.sched.Next(now)
 	)
 	defer func() {
-		if next.Sub(expireAt) > 0 {
-			next = expireAt
-		}
 		interval := time.Now().Sub(next)
-		if h.maxInterval != 0 && interval > h.maxInterval {
+		if h.enableMaxSync && interval > h.maxInterval {
 			interval = h.maxInterval
-		} else if interval < h.minInterval {
+		}
+		if h.enableMinSync && interval < h.minInterval {
 			interval = h.minInterval
 		}
-		zap.L().Info(
-			"reset timer",
-			zap.String("key", h.key),
-			zap.Time("next", time.Now().Add(interval)),
-		)
+		if time.Now().Add(interval).After(expireAt) {
+			interval = expireAt.Sub(time.Now())
+		}
 		h.timer.Reset(interval)
 	}()
-	if local != 0 {
-		key := h.key + ":" + strconv.FormatInt(expireAt.Unix(), 10)
-		total, err := h.cache.IncrBy(context.Background(), key, local).Result()
-		if err != nil {
-			return now, err
-		}
-		h.cache.Expire(context.Background(), key, time.Now().Sub(expireAt)+h.followInterval)
 
-		atomic.StoreInt32(&h.spinForUpdate, 1)
-		atomic.StoreInt64(&h.remote, total)
-		atomic.AddInt64(&h.local, -local)
-		h.latestSyncAt = now
-		atomic.StoreInt32(&h.spinForUpdate, 0)
-		zap.L().Info(
-			"fetched total hitted",
-			zap.String("key", h.key),
-			zap.Int64("total", total),
-		)
-		if h.enableLimit && total >= h.limit {
-			return expireAt, nil
-		}
+	key := h.keyPrefix + h.key + expireAt.Format(h.keySuffixFormat)
+	remote, err := h.redis.IncrBy(context.Background(), key, local).Result()
+	if err != nil {
+		return now, err
 	}
-	h.ewma.Add(float64(local) / h.latestSyncAt.Sub(now).Seconds())
-	qps := h.ewma.Value()
-	if h.cache != nil {
-		h.cache.Set(context.Background(), h.key+":"+NodeID+NodesQPSCacheKeySuffix, qps, h.nodeExpireInterval)
-		if err := h.cache.ZAdd(context.Background(), h.key+NodesCacheKeySuffix, &redis.Z{Score: float64(now.Unix()), Member: NodeID}).Err(); err != nil {
-			h.cache.Expire(context.Background(), h.key+NodesCacheKeySuffix, h.nodeExpireInterval)
-		}
-		qps = h.QPS()
+	h.redis.Expire(context.Background(), key, time.Now().Sub(expireAt)+h.followInterval)
+	atomic.StoreInt64(&h.synced, remote)
+	atomic.AddInt64(&h.unsync, remote-unsync)
+
+	keyQPS := h.keyPrefix + h.key + h.nodeID + h.keyQPSSuffix
+	if now.After(h.syncedAt) {
+		h.qps.Add(float64(local) / now.Sub(h.syncedAt).Seconds())
+		h.redis.Set(context.Background(), keyQPS, h.qps.Value(), time.Now().Sub(expireAt)+h.followInterval)
 	}
-	if h.enableLimit {
-		total := atomic.LoadInt64(&h.remote) + atomic.LoadInt64(&h.local)
-		estimate := time.Duration(float64(h.limit-total) / qps * float64(time.Second))
-		return now.Add(estimate / 2), nil
+	h.syncedAt = now
+
+	if h.enableLimit && remote >= h.limit {
+		return expireAt, nil
 	}
-	return now.Add(h.maxInterval), nil
+	qps := h.QPS()
+	if qps <= 100/float64(h.limit) {
+		return time.Now().Add(time.Duration(float64(now.Sub(expireAt)) * h.stableRate)), nil
+	}
+	return time.Now().Add(time.Duration(float64(h.limit-remote) / qps * float64(time.Second) * h.stableRate)), nil
 }
-
-func (h *Hitter) Hit() (err error) {
-	if !Enable {
-		return nil
+func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
+	if expireAt := h.sched.Next(h.hittedAt); now.After(expireAt) {
+		if _, err := h.sync(expireAt); err != nil {
+			return expireAt, err
+		}
 	}
-	now := time.Now()
+	return h.sync(time.Now())
+}
+func (h *Hitter) Hit() (ok bool, err error) {
+	defer func() {
+		if ok {
+			h.hittedAt = time.Now()
+		}
+	}()
 	select {
 	case <-h.timer.C:
-		atomic.StoreInt32(&h.spinForExpire, 1)
-		if expireAt := h.expire.Next(h.latestHitAt); now.Sub(expireAt) > 0 {
-			zap.L().Info(
-				"after expire",
-				zap.String("key", h.key),
-				zap.Time("expire", expireAt),
-			)
-			h.Sync(h.latestHitAt)
-		}
-		atomic.StoreInt32(&h.spinForExpire, 0)
-		h.Sync(now)
+		h.Sync(time.Now())
 	default:
 	}
-	for atomic.LoadInt32(&h.spinForUpdate) != 0 {
-	}
-	if h.enableLimit &&
-		atomic.LoadInt64(&h.remote)+atomic.LoadInt64(&h.local) >= h.limit {
-		if atomic.LoadInt64(&h.local) != 0 {
-			h.Sync(time.Now())
+	if h.enableLimit {
+		if atomic.LoadInt64(&h.unsync) >= h.limit {
+			return false, nil
 		}
-		return ErrOverhit
+		if unsync := atomic.AddInt64(&h.unsync, 1); unsync <= h.limit {
+			return true, nil
+		}
+		atomic.AddInt64(&h.unsync, -1)
+		h.Sync(time.Now())
+		return false, nil
 	}
-	for atomic.LoadInt32(&h.spinForExpire) != 0 {
-	}
-	atomic.AddInt64(&h.local, 1)
-	h.latestHitAt = now
-	return nil
+	return true, nil
 }
 
-func (h *Hitter) Close() error {
-	h.Sync(time.Now())
-	h.timer.Stop()
-	return nil
+func (h *Hitter) Background() {
+	for {
+		select {
+		case now, ok := <-h.timer.C:
+			if !ok {
+				return
+			}
+			h.Sync(now)
+		}
+	}
 }
-
 func (h *Hitter) Hitted() int64 {
 	h.Sync(time.Now())
-	return atomic.LoadInt64(&h.remote) + atomic.LoadInt64(&h.local)
-}
-func (h *Hitter) Limit() int64 {
-	return h.limit
+	return atomic.LoadInt64(&h.unsync)
 }
 func (h *Hitter) QPS() float64 {
-	qps := h.ewma.Value()
-	if h.cache != nil {
-		now := time.Now()
-		nodeIDs, err := h.cache.ZRangeByScore(context.Background(), h.key+NodesCacheKeySuffix, &redis.ZRangeBy{
-			Min: strconv.FormatInt(now.Add(h.nodeExpireInterval).Unix(), 10),
-			Max: strconv.FormatInt(now.Unix(), 10),
-		}).Result()
-		if err == nil {
-			zap.L().Info(
-				"alive nodes",
-				zap.String("key", h.key),
-				zap.Strings("nodes", nodeIDs),
-			)
-			fetched := qps / float64(len(nodeIDs))
-			for _, nodeID := range nodeIDs {
-				if nodeID == NodeID {
-					continue
-				}
-				v, err := h.cache.Get(context.Background(), h.key+":"+nodeID+NodesQPSCacheKeySuffix).Float64()
-				if err != nil {
-					fetched += qps / float64(len(nodeIDs))
-					continue
-				}
-				fetched += v / float64(len(nodeIDs))
-				zap.L().Info(
-					"fetched node qps",
-					zap.String("key", h.key),
-					zap.String("node", nodeID),
-					zap.Float64("qps", v),
-				)
+	nodeIDs, err := h.NodeIDs()
+	if err != nil {
+		return h.qps.Value()
+	}
+	var (
+		num float64 = h.qps.Value()
+		den int     = 1
+	)
+	for _, nodeID := range nodeIDs {
+		if nodeID != h.nodeID {
+			nodeQPS, err := h.redis.Get(context.Background(), h.keyPrefix+h.key+nodeID+h.keyQPSSuffix).Float64()
+			if err != nil {
+				continue
 			}
-			h.ewma.Set(fetched)
-			zap.L().Info("fetched clusters",
-				zap.String("key", h.key),
-				zap.Float64("qps", fetched),
-				zap.Float64("delta", fetched-qps),
-			)
-			return fetched
+			num += nodeQPS
+			den += 1
 		}
 	}
-	return qps
+	return num / float64(den)
+}
+func (h *Hitter) Close() error {
+	defer h.timer.Stop()
+	_, err := h.Sync(time.Now())
+	return err
 }
