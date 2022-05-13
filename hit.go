@@ -161,6 +161,9 @@ func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
 	return time.Now().Add(time.Duration(float64(h.limit-remote) / qps * float64(time.Second) * h.stableRate)), nil
 }
 func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
+	if h.Node != nil {
+		h.Node.Heartbeat()
+	}
 	if expireAt := h.sched.Next(h.hittedAt); now.After(expireAt) {
 		if _, err := h.sync(expireAt); err != nil {
 			return expireAt, err
@@ -174,10 +177,12 @@ func (h *Hitter) Hit() (ok bool, err error) {
 			h.hittedAt = time.Now()
 		}
 	}()
-	select {
-	case <-h.timer.C:
-		h.Sync(time.Now())
-	default:
+	if h.Node != nil {
+		select {
+		case <-h.timer.C:
+			h.Sync(time.Now())
+		default:
+		}
 	}
 	if EnableLimit && h.enableLimit {
 		if atomic.LoadInt64(&h.unsync) >= h.limit {
@@ -194,6 +199,10 @@ func (h *Hitter) Hit() (ok bool, err error) {
 }
 
 func (h *Hitter) Background() {
+	if h.Node == nil {
+		return
+	}
+	go h.Node.Background()
 	for {
 		select {
 		case now, ok := <-h.timer.C:
@@ -205,32 +214,40 @@ func (h *Hitter) Background() {
 	}
 }
 func (h *Hitter) Hitted() int64 {
-	h.Sync(time.Now())
+	if h.Node != nil {
+		h.Sync(time.Now())
+	}
 	return atomic.LoadInt64(&h.unsync)
 }
 func (h *Hitter) QPS() float64 {
-	nodeIDs, err := h.NodeIDs()
-	if err != nil {
-		return h.qps.Value()
-	}
-	var (
-		num float64 = h.qps.Value()
-		den int     = 1
-	)
-	for _, nodeID := range nodeIDs {
-		if nodeID != h.nodeID {
-			nodeQPS, err := h.redis.Get(context.Background(), h.keyPrefix+h.key+nodeID+h.keyQPSSuffix).Float64()
-			if err != nil {
-				continue
-			}
-			num += nodeQPS
-			den += 1
+	if h.Node != nil {
+		nodeIDs, err := h.NodeIDs()
+		if err != nil {
+			return h.qps.Value()
 		}
+		var (
+			num float64 = h.qps.Value()
+			den int     = 1
+		)
+		for _, nodeID := range nodeIDs {
+			if nodeID != h.nodeID {
+				nodeQPS, err := h.redis.Get(context.Background(), h.keyPrefix+h.key+nodeID+h.keyQPSSuffix).Float64()
+				if err != nil {
+					continue
+				}
+				num += nodeQPS
+				den += 1
+			}
+		}
+		return num / float64(den)
 	}
-	return num / float64(den)
+	return h.qps.Value()
 }
 func (h *Hitter) Close() error {
 	defer h.timer.Stop()
+	if h.Node != nil {
+		h.Node.Close()
+	}
 	_, err := h.Sync(time.Now())
 	return err
 }
