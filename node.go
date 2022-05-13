@@ -38,7 +38,7 @@ type Node struct {
 	timer          *time.Timer
 }
 
-func NewNode(opt *NodeOption) *Node {
+func NewNode(opt *NodeOption) (*Node, error) {
 	nodesKey := opt.KeyPrefix + DefaultNodesKeySuffix
 	if opt.NodesKeySuffix != "" {
 		nodesKey = opt.KeyPrefix + opt.NodesKeySuffix
@@ -51,7 +51,7 @@ func NewNode(opt *NodeOption) *Node {
 		expireInterval: opt.ExpireInterval,
 		timer:          time.NewTimer(time.Duration(float64(opt.ExpireInterval) * 0.9)),
 	}
-	return &n
+	return &n, n.redis.Ping(context.Background()).Err()
 }
 func (n *Node) clean() error {
 	return n.redis.ZRemRangeByScore(

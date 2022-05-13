@@ -19,7 +19,7 @@ var (
 )
 
 type HitterOption struct {
-	NodeOption
+	*NodeOption
 
 	ExpireSpec      string
 	ShakeRate       float64
@@ -88,8 +88,6 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 		keyQPSSuffix = opt.KeyQPSSuffix
 	}
 	h := Hitter{
-		Node: NewNode(&opt.NodeOption),
-
 		sched:           sched,
 		stableRate:      stableRate,
 		enableMaxSync:   opt.EnableMaxSync,
@@ -107,6 +105,13 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 		hittedAt: now,
 
 		qps: ewma.NewMovingAverage(),
+	}
+	if opt.NodeOption != nil {
+		node, err := NewNode(opt.NodeOption)
+		if err != nil {
+			return nil, err
+		}
+		h.Node = node
 	}
 	return &h, nil
 }
