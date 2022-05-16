@@ -2,6 +2,7 @@ package ghit
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -12,17 +13,14 @@ import (
 var (
 	EnableLimit = true
 
-	DefaultShakeRate = 0.5
-
-	DefaultKeyQPSSuffix    = ":QPS"
-	DefaultKeySuffixFormat = "2006-01-02"
+	DefaultKeyQPSSuffix = ":QPS"
 )
 
 type HitterOption struct {
 	*NodeOption
 
 	ExpireSpec      string
-	ShakeRate       float64
+	QPSShakeCoeff   float64
 	EnableMaxSync   bool
 	MaxSyncInterval time.Duration
 	EnableMinSync   bool
@@ -40,7 +38,7 @@ type Hitter struct {
 	*Node
 
 	sched           cron.Schedule
-	stableRate      float64
+	qpsStableRate   float64
 	enableMaxSync   bool
 	maxSyncInterval time.Duration
 	enableMinSync   bool
@@ -58,6 +56,7 @@ type Hitter struct {
 	synced   int64
 	unsync   int64
 	hittedAt time.Time
+	expireAt time.Time
 
 	enableLimit bool
 	limit       int64
@@ -69,27 +68,13 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 	if err != nil {
 		return nil, err
 	}
-	stableRate := 1 / DefaultShakeRate
-	if opt.ShakeRate < 0 {
-		if opt.ShakeRate >= 1 {
-			stableRate = 0
-		} else if opt.ShakeRate == 0 {
-			stableRate = 1
-		} else {
-			stableRate = 1 / opt.ShakeRate
-		}
-	}
-	keySuffixFormat := DefaultKeySuffixFormat
-	if opt.KeySuffixFormat != "" {
-		keySuffixFormat = opt.KeySuffixFormat
-	}
 	keyQPSSuffix := opt.Key + DefaultKeyQPSSuffix
 	if opt.KeyQPSSuffix != "" {
 		keyQPSSuffix = opt.KeyQPSSuffix
 	}
 	h := Hitter{
 		sched:           sched,
-		stableRate:      stableRate,
+		qpsStableRate:   float64(1) / opt.QPSShakeCoeff,
 		enableMaxSync:   opt.EnableMaxSync,
 		maxSyncInterval: opt.MaxSyncInterval,
 		enableMinSync:   opt.EnableMinSync,
@@ -98,13 +83,16 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 
 		key:             opt.Key,
 		keyQPSSuffix:    keyQPSSuffix,
-		keySuffixFormat: keySuffixFormat,
+		keySuffixFormat: opt.KeySuffixFormat,
 
 		timer:    time.NewTimer(0),
 		syncedAt: now,
 		hittedAt: now,
 
 		qps: ewma.NewMovingAverage(),
+
+		enableLimit: opt.EnableLimit,
+		limit:       opt.Limit,
 	}
 	if opt.NodeOption != nil {
 		node, err := NewNode(opt.NodeOption)
@@ -113,19 +101,26 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 		}
 		h.Node = node
 	}
-	return &h, nil
+	_, err = h.Sync(time.Now())
+	return &h, err
 }
 
 func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
+	var (
+		unsync = atomic.LoadInt64(&h.unsync)
+		local  = unsync - atomic.LoadInt64(&h.synced)
+	)
+
 	if h.Node == nil {
-		return time.Time{}, nil
+		if now == h.expireAt {
+			atomic.StoreInt64(&h.unsync, 0)
+		}
+		atomic.StoreInt64(&h.synced, local)
+		h.qps.Add(float64(local) / now.Sub(h.syncedAt).Seconds())
+		h.syncedAt = now
+		return h.expireAt, nil
 	}
 
-	var (
-		unsync   = atomic.LoadInt64(&h.unsync)
-		local    = unsync - h.synced
-		expireAt = h.sched.Next(now)
-	)
 	defer func() {
 		interval := time.Now().Sub(next)
 		if h.enableMaxSync && interval > h.maxSyncInterval {
@@ -134,47 +129,54 @@ func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
 		if h.enableMinSync && interval < h.minSyncInterval {
 			interval = h.minSyncInterval
 		}
-		if time.Now().Add(interval).After(expireAt) {
-			interval = expireAt.Sub(time.Now())
+		if time.Now().Add(interval).After(h.expireAt) {
+			interval = h.expireAt.Sub(time.Now())
 		}
 		h.timer.Reset(interval)
 	}()
 
-	key := h.keyPrefix + h.key + expireAt.Format(h.keySuffixFormat)
+	var keySuffix string
+	if h.keySuffixFormat != "" {
+		keySuffix = h.expireAt.Format(h.keySuffixFormat)
+	} else {
+		keySuffix = ":" + strconv.FormatInt(h.expireAt.UnixMilli(), 10)
+	}
+	key := h.keyPrefix + h.key + keySuffix
 	remote, err := h.redis.IncrBy(context.Background(), key, local).Result()
 	if err != nil {
 		return now, err
 	}
-	h.redis.Expire(context.Background(), key, time.Now().Sub(expireAt)+h.followInterval)
+	h.redis.Expire(context.Background(), key, time.Now().Sub(h.expireAt)+h.followInterval)
 	atomic.StoreInt64(&h.synced, remote)
 	atomic.AddInt64(&h.unsync, remote-unsync)
 
-	keyQPS := h.keyPrefix + h.key + h.nodeID + h.keyQPSSuffix
+	keyQPS := h.keyPrefix + h.key + ":" + h.nodeID + h.keyQPSSuffix
 	if now.After(h.syncedAt) {
 		h.qps.Add(float64(local) / now.Sub(h.syncedAt).Seconds())
-		h.redis.Set(context.Background(), keyQPS, h.qps.Value(), time.Now().Sub(expireAt)+h.followInterval)
+		h.redis.Set(context.Background(), keyQPS, h.qps.Value(), time.Now().Sub(h.expireAt)+h.followInterval)
 	}
 	h.syncedAt = now
 
-	if h.enableLimit && remote >= h.limit {
-		return expireAt, nil
+	if EnableLimit && h.enableLimit && remote >= h.limit {
+		return h.expireAt, nil
 	}
-	qps := h.QPS()
+	qps := h.clusterQPS()
 	if qps <= 100/float64(h.limit) {
-		return time.Now().Add(time.Duration(float64(now.Sub(expireAt)) * h.stableRate)), nil
+		return time.Now().Add(time.Duration(float64(now.Sub(h.expireAt)) * h.qpsStableRate)), nil
 	}
-	return time.Now().Add(time.Duration(float64(h.limit-remote) / qps * float64(time.Second) * h.stableRate)), nil
+	return time.Now().Add(time.Duration(float64(h.limit-remote) / qps * float64(time.Second) * h.qpsStableRate)), nil
 }
 func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 	if h.Node != nil {
-		h.Node.Heartbeat()
+		defer h.Node.Heartbeat()
 	}
-	if expireAt := h.sched.Next(h.hittedAt); now.After(expireAt) {
-		if _, err := h.sync(expireAt); err != nil {
-			return expireAt, err
+	if now.After(h.expireAt) {
+		if _, err := h.sync(h.expireAt); err != nil {
+			return h.expireAt, err
 		}
+		h.expireAt = h.sched.Next(now)
 	}
-	return h.sync(time.Now())
+	return h.sync(now)
 }
 func (h *Hitter) Hit() (ok bool, err error) {
 	defer func() {
@@ -185,7 +187,9 @@ func (h *Hitter) Hit() (ok bool, err error) {
 	if h.Node != nil {
 		select {
 		case <-h.timer.C:
-			h.Sync(time.Now())
+			if _, err := h.Sync(time.Now()); err != nil {
+				return false, err
+			}
 		default:
 		}
 	}
@@ -196,8 +200,10 @@ func (h *Hitter) Hit() (ok bool, err error) {
 		if unsync := atomic.AddInt64(&h.unsync, 1); unsync <= h.limit {
 			return true, nil
 		}
-		atomic.AddInt64(&h.unsync, -1)
-		h.Sync(time.Now())
+		defer atomic.AddInt64(&h.unsync, -1)
+		if _, err := h.Sync(time.Now()); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	return true, nil
@@ -219,32 +225,34 @@ func (h *Hitter) Background() {
 	}
 }
 func (h *Hitter) Hitted() int64 {
-	if h.Node != nil {
-		h.Sync(time.Now())
-	}
+	h.Sync(time.Now())
 	return atomic.LoadInt64(&h.unsync)
 }
-func (h *Hitter) QPS() float64 {
-	if h.Node != nil {
-		nodeIDs, err := h.NodeIDs()
-		if err != nil {
-			return h.qps.Value()
-		}
-		var (
-			num float64 = h.qps.Value()
-			den int     = 1
-		)
-		for _, nodeID := range nodeIDs {
-			if nodeID != h.nodeID {
-				nodeQPS, err := h.redis.Get(context.Background(), h.keyPrefix+h.key+nodeID+h.keyQPSSuffix).Float64()
-				if err != nil {
-					continue
-				}
-				num += nodeQPS
-				den += 1
+func (h *Hitter) clusterQPS() float64 {
+	nodeIDs, err := h.NodeIDs()
+	if err != nil {
+		return h.qps.Value()
+	}
+	var (
+		num float64 = h.qps.Value()
+		den int     = 1
+	)
+	for _, nodeID := range nodeIDs {
+		if nodeID != h.nodeID {
+			nodeQPS, err := h.redis.Get(context.Background(), h.keyPrefix+h.key+nodeID+h.keyQPSSuffix).Float64()
+			if err != nil {
+				continue
 			}
+			num += nodeQPS
+			den += 1
 		}
-		return num / float64(den)
+	}
+	return num / float64(den)
+}
+func (h *Hitter) QPS() float64 {
+	h.Sync(time.Now())
+	if h.Node != nil {
+		return h.clusterQPS()
 	}
 	return h.qps.Value()
 }

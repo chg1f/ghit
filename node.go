@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	DefaultNodesKeySuffix = ":NODES"
+	DefaultNodesKeySuffix = "NODES"
+	DefaultNodeExpire     = time.Hour
 )
 
 var (
@@ -43,23 +44,19 @@ func NewNode(opt *NodeOption) (*Node, error) {
 	if opt.NodesKeySuffix != "" {
 		nodesKey = opt.KeyPrefix + opt.NodesKeySuffix
 	}
+	expireInterval := DefaultNodeExpire
+	if opt.ExpireInterval != 0 {
+		expireInterval = opt.ExpireInterval
+	}
 	n := Node{
 		redis:          opt.Redis,
 		keyPrefix:      opt.KeyPrefix,
 		nodesKey:       nodesKey,
 		nodeID:         opt.NodeID,
-		expireInterval: opt.ExpireInterval,
+		expireInterval: expireInterval,
 		timer:          time.NewTimer(time.Duration(float64(opt.ExpireInterval) * 0.9)),
 	}
 	return &n, n.redis.Ping(context.Background()).Err()
-}
-func (n *Node) clean() error {
-	return n.redis.ZRemRangeByScore(
-		context.Background(),
-		n.nodesKey,
-		"0",
-		strconv.FormatInt(time.Now().Add(-n.expireInterval).Unix(), 10),
-	).Err()
 }
 func (n *Node) NodeID() string {
 	if n.nodeID != "" {
@@ -67,20 +64,20 @@ func (n *Node) NodeID() string {
 	}
 	return NodeID
 }
+
 func (n *Node) Heartbeat() error {
 	defer n.redis.Expire(
 		context.Background(),
 		n.nodesKey,
 		n.expireInterval,
 	)
-	n.clean()
 	n.timer.Reset(time.Duration(float64(n.expireInterval) * 0.9))
 	return n.redis.ZAdd(
 		context.Background(),
 		n.nodesKey,
 		&redis.Z{
 			Member: n.NodeID(),
-			Score:  float64(time.Now().Unix()),
+			Score:  float64(time.Now().UnixMilli()),
 		},
 	).Err()
 }
@@ -93,34 +90,51 @@ func (n *Node) Dead() error {
 	return n.redis.ZRem(
 		context.Background(),
 		n.nodesKey,
-		&redis.Z{
-			Member: n.NodeID(),
-		},
+		n.NodeID(),
+	).Err()
+}
+func (n *Node) Clean() error {
+	defer n.redis.Expire(
+		context.Background(),
+		n.nodesKey,
+		n.expireInterval,
+	)
+	return n.redis.ZRemRangeByScore(
+		context.Background(),
+		n.nodesKey,
+		"0",
+		strconv.FormatInt(time.Now().Add(-n.expireInterval).UnixMilli(), 10),
 	).Err()
 }
 func (n *Node) NodeIDs() ([]string, error) {
-	defer n.clean()
+	defer n.redis.Expire(
+		context.Background(),
+		n.nodesKey,
+		n.expireInterval,
+	)
 	return n.redis.ZRangeByScore(
 		context.Background(),
 		n.nodesKey,
 		&redis.ZRangeBy{
-			Min: strconv.FormatInt(time.Now().Add(-n.expireInterval).Unix(), 10),
-			Max: strconv.FormatInt(time.Now().Unix(), 10),
+			Min: strconv.FormatInt(time.Now().Add(-n.expireInterval).UnixMilli(), 10),
+			Max: strconv.FormatInt(time.Now().UnixMilli(), 10),
 		},
 	).Result()
 }
-func (h *Node) Background() {
+func (n *Node) Background() {
 	for {
 		select {
-		case _, ok := <-h.timer.C:
+		case _, ok := <-n.timer.C:
 			if !ok {
 				return
 			}
-			h.Heartbeat()
+			n.Heartbeat()
+			n.Clean()
 		}
 	}
 }
 func (n *Node) Close() error {
 	n.timer.Stop()
+	defer n.Clean()
 	return n.Dead()
 }
