@@ -7,9 +7,14 @@ jobs:
         go-version: [1.18.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    services:
+      redis:
+        image: redis
     steps:
     - uses: actions/setup-go@v3
       with:
         go-version: ${{ matrix.go-version }}
     - uses: actions/checkout@v3
-    - run: go test ./...
+    - run: make
+      env:
+        REDIS_ADDRESS: redis:6379
