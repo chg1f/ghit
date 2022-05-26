@@ -258,9 +258,9 @@ func (h *Hitter) QPS() float64 {
 }
 func (h *Hitter) Close() error {
 	defer h.timer.Stop()
-	if h.Node != nil {
-		h.Node.Close()
-	}
+	// if h.Node != nil {
+	// 	h.Node.Close()
+	// }
 	_, err := h.Sync(time.Now())
 	return err
 }
