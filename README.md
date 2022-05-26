@@ -29,6 +29,14 @@ import "github.com/chg1f/ghit"
   - [func (n *Node) NodeID() string](<#func-node-nodeid>)
   - [func (n *Node) NodeIDs() ([]string, error)](<#func-node-nodeids>)
 - [type NodeOption](<#type-nodeoption>)
+- [type Pool](<#type-pool>)
+  - [func NewPool(opt *PoolOption) (*Pool, error)](<#func-newpool>)
+  - [func (p *Pool) Close() error](<#func-pool-close>)
+  - [func (p *Pool) ForEach(f func(string, *Hitter) bool)](<#func-pool-foreach>)
+  - [func (p *Pool) Hit(opt *HitterOption) (bool, error)](<#func-pool-hit>)
+  - [func (p *Pool) LoadOrStore(opt *HitterOption) (*Hitter, error)](<#func-pool-loadorstore>)
+  - [func (p *Pool) Store(opt *HitterOption) (*Hitter, error)](<#func-pool-store>)
+- [type PoolOption](<#type-pooloption>)
 
 
 ## Constants
@@ -256,6 +264,59 @@ type NodeOption struct {
     NodesKeySuffix string
     NodeID         string
     ExpireInterval time.Duration
+}
+```
+
+## type Pool
+
+```go
+type Pool struct {
+    *Node
+    // contains filtered or unexported fields
+}
+```
+
+### func NewPool
+
+```go
+func NewPool(opt *PoolOption) (*Pool, error)
+```
+
+### func \(\*Pool\) Close
+
+```go
+func (p *Pool) Close() error
+```
+
+### func \(\*Pool\) ForEach
+
+```go
+func (p *Pool) ForEach(f func(string, *Hitter) bool)
+```
+
+### func \(\*Pool\) Hit
+
+```go
+func (p *Pool) Hit(opt *HitterOption) (bool, error)
+```
+
+### func \(\*Pool\) LoadOrStore
+
+```go
+func (p *Pool) LoadOrStore(opt *HitterOption) (*Hitter, error)
+```
+
+### func \(\*Pool\) Store
+
+```go
+func (p *Pool) Store(opt *HitterOption) (*Hitter, error)
+```
+
+## type PoolOption
+
+```go
+type PoolOption struct {
+    *NodeOption
 }
 ```
 
