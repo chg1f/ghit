@@ -167,6 +167,9 @@ type HitterOption struct {
 
     EnableLimit bool
     Limit       int64
+
+    ExpiredHook func(*Hitter)
+    SyncedHook  func(*Hitter)
 }
 ```
 
@@ -264,6 +267,9 @@ type NodeOption struct {
     NodesKeySuffix string
     NodeID         string
     ExpireInterval time.Duration
+
+    HeartbeatHook func(*Node)
+    DeadHook      func(*Node)
 }
 ```
 
