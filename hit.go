@@ -33,6 +33,9 @@ type HitterOption struct {
 
 	EnableLimit bool
 	Limit       int64
+
+	ExpiredHook func(*Hitter)
+	SyncedHook  func(*Hitter)
 }
 type Hitter struct {
 	*Node
@@ -60,6 +63,9 @@ type Hitter struct {
 
 	enableLimit bool
 	limit       int64
+
+	expiredHook func(*Hitter)
+	syncedHook  func(*Hitter)
 }
 
 func NewHitter(opt *HitterOption) (*Hitter, error) {
@@ -93,6 +99,9 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 
 		enableLimit: opt.EnableLimit,
 		limit:       opt.Limit,
+
+		expiredHook: opt.ExpiredHook,
+		syncedHook:  opt.SyncedHook,
 	}
 	if opt.NodeOption != nil {
 		node, err := NewNode(opt.NodeOption)
@@ -174,7 +183,13 @@ func (h *Hitter) Sync(now time.Time) (next time.Time, err error) {
 		if _, err := h.sync(h.expireAt); err != nil {
 			return h.expireAt, err
 		}
+		if h.expiredHook != nil {
+			h.expiredHook(h)
+		}
 		h.expireAt = h.sched.Next(now)
+	}
+	if h.syncedHook != nil {
+		defer h.syncedHook(h)
 	}
 	return h.sync(now)
 }

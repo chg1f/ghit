@@ -29,6 +29,9 @@ type NodeOption struct {
 	NodesKeySuffix string
 	NodeID         string
 	ExpireInterval time.Duration
+
+	HeartbeatHook func(*Node)
+	DeadHook      func(*Node)
 }
 type Node struct {
 	redis          redis.Cmdable
@@ -37,6 +40,9 @@ type Node struct {
 	nodeID         string
 	expireInterval time.Duration
 	timer          *time.Timer
+
+	heartbeatHook func(*Node)
+	deadHook      func(*Node)
 }
 
 func NewNode(opt *NodeOption) (*Node, error) {
@@ -55,6 +61,9 @@ func NewNode(opt *NodeOption) (*Node, error) {
 		nodeID:         opt.NodeID,
 		expireInterval: expireInterval,
 		timer:          time.NewTimer(time.Duration(float64(opt.ExpireInterval) * 0.9)),
+
+		heartbeatHook: opt.HeartbeatHook,
+		deadHook:      opt.DeadHook,
 	}
 	return &n, n.redis.Ping(context.Background()).Err()
 }
@@ -72,6 +81,9 @@ func (n *Node) Heartbeat() error {
 		n.expireInterval,
 	)
 	n.timer.Reset(time.Duration(float64(n.expireInterval) * 0.9))
+	if n.heartbeatHook != nil {
+		defer n.heartbeatHook(n)
+	}
 	return n.redis.ZAdd(
 		context.Background(),
 		n.nodesKey,
@@ -87,6 +99,9 @@ func (n *Node) Dead() error {
 		n.nodesKey,
 		n.expireInterval,
 	)
+	if n.deadHook != nil {
+		defer n.deadHook(n)
+	}
 	return n.redis.ZRem(
 		context.Background(),
 		n.nodesKey,
