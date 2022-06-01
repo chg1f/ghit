@@ -114,6 +114,13 @@ func NewHitter(opt *HitterOption) (*Hitter, error) {
 	return &h, err
 }
 
+func (h *Hitter) Group() string {
+	if h.keySuffixFormat != "" {
+		return h.expireAt.Format(h.keySuffixFormat)
+	} else {
+		return strconv.FormatInt(h.expireAt.UnixMilli(), 10)
+	}
+}
 func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
 	var (
 		unsync = atomic.LoadInt64(&h.unsync)
@@ -144,13 +151,7 @@ func (h *Hitter) sync(now time.Time) (next time.Time, err error) {
 		h.timer.Reset(interval)
 	}()
 
-	var keySuffix string
-	if h.keySuffixFormat != "" {
-		keySuffix = h.expireAt.Format(h.keySuffixFormat)
-	} else {
-		keySuffix = ":" + strconv.FormatInt(h.expireAt.UnixMilli(), 10)
-	}
-	key := h.keyPrefix + h.key + keySuffix
+	key := h.keyPrefix + h.key + ":" + h.Group()
 	remote, err := h.redis.IncrBy(context.Background(), key, local).Result()
 	if err != nil {
 		return now, err
@@ -239,8 +240,10 @@ func (h *Hitter) Background() {
 		}
 	}
 }
+func (h *Hitter) Key() string {
+	return h.key
+}
 func (h *Hitter) Hitted() int64 {
-	h.Sync(time.Now())
 	return atomic.LoadInt64(&h.unsync)
 }
 func (h *Hitter) clusterQPS() float64 {
@@ -265,7 +268,6 @@ func (h *Hitter) clusterQPS() float64 {
 	return num / float64(den)
 }
 func (h *Hitter) QPS() float64 {
-	h.Sync(time.Now())
 	if h.Node != nil {
 		return h.clusterQPS()
 	}
